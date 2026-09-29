@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Деталь в 3D</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { --bg: #16181c; --text: #f2f2f2; --hint: #9aa0a6; --accent: #f5a524; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 15px/1.35 -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+  #scene { position: fixed; inset: 0; }
+  #info { position: fixed; left: 16px; right: 16px; top: 14px; pointer-events: none; }
+  #name { font-weight: 700; font-size: 20px; }
+  #size { color: var(--accent); font-weight: 600; margin-top: 2px; }
+  #note { color: var(--hint); font-size: 13px; margin-top: 4px; }
+  #hint { position: fixed; bottom: 18px; width: 100%; text-align: center; color: var(--hint); font-size: 13px; }
+  #err { position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+    padding: 24px; text-align: center; color: var(--hint); }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="scene"></div>
+<div id="info"><div id="name"></div><div id="size"></div><div id="note"></div></div>
+<div id="hint">Крути пальцем · щипок – масштаб</div>
+<div id="err"></div>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+
+const tg = window.Telegram?.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+
+// Параметры детали приходят в ссылке от бота: ?type=bushing&D=30&d=20&L=25&c=0.5&name=...
+// Для вала: ?type=shaft&steps=20x40,25x60
+const q = new URLSearchParams(location.search);
+// Открыли не из бота (например, из каталога мини-аппов) – показываем пример
+const demo = !q.has("D") && !q.has("steps");
+if (demo) {
+  for (const [k, v] of Object.entries({ type: "bearing", name: "Подшипник 6205-2RS", D: 52, d: 25, B: 15, seal: 1 })) q.set(k, v);
+}
+const num = k => parseFloat((q.get(k) || "").replace(",", "."));
+const f = x => String(+x.toFixed(2)).replace(".", ",");
+const type = q.get("type") || "bushing";
+
+function fail(msg) {
+  const e = document.getElementById("err");
+  e.textContent = msg; e.style.display = "flex";
+  document.getElementById("hint").style.display = "none";
+}
+
+// Профиль тела вращения (r, y) с фасками 45° на четырёх кромках кольца
+function ringProfile(D, d, L, c) {
+  const R = D / 2, r = d / 2;
+  if (!c) return [[r, 0], [R, 0], [R, L], [r, L], [r, 0]];
+  return [[r + c, 0], [R - c, 0], [R, c], [R, L - c], [R - c, L], [r + c, L], [r, L - c], [r, c], [r + c, 0]];
+}
+
+function shaftProfile(steps) {
+  const pts = [[0, 0]];
+  let y = 0;
+  for (const s of steps) { pts.push([s.D / 2, y]); y += s.L; pts.push([s.D / 2, y]); }
+  pts.push([0, y]);
+  return pts;
+}
+
+function lathe(points, material) {
+  const geo = new THREE.LatheGeometry(points.map(([x, y]) => new THREE.Vector2(x, y)), 128);
+  geo.computeVertexNormals();
+  return new THREE.Mesh(geo, material);
+}
+
+const steel = new THREE.MeshStandardMaterial({ color: 0xb4b9c0, metalness: 1, roughness: 0.32 });
+const darkSteel = new THREE.MeshStandardMaterial({ color: 0x8d9299, metalness: 1, roughness: 0.35 });
+const seal = new THREE.MeshStandardMaterial({ color: 0x222428, metalness: 0.1, roughness: 0.7 });
+
+function build() {
+  const group = new THREE.Group();
+  let name = q.get("name"), size = "", note = "";
+
+  if (type === "shaft") {
+    const steps = (q.get("steps") || "").split(",").map(s => s.split("x").map(Number))
+      .filter(a => a.length === 2 && a.every(v => v > 0)).map(([D, L]) => ({ D, L }));
+    if (!steps.length) throw new Error("Нет размеров вала");
+    group.add(lathe(shaftProfile(steps), steel));
+    name ||= "Вал";
+    size = steps.map(s => `⌀${f(s.D)}×${f(s.L)}`).join(" · ");
+    return { group, name, size, note };
+  }
+
+  const D = num("D"), d = num("d"), L = num("L") || num("B") || num("H"), c = num("c") || 0;
+  if (!(D > 0 && d > 0 && L > 0 && d < D)) throw new Error("Нет размеров детали");
+
+  if (type === "bearing") {
+    // Наглядная модель: кольца, шарики, уплотнение. В STEP – габаритное кольцо того же размера.
+    const wall = (D - d) / 2, t = wall * 0.28, R = D / 2, r = d / 2;
+    group.add(lathe(ringProfile(D, D - 2 * t, L, Math.min(0.5, t / 4)), steel));
+    group.add(lathe(ringProfile(d + 2 * t, d, L, Math.min(0.5, t / 4)), steel));
+    const pitch = (R + r) / 2, ball = (wall - 2 * t) * 0.48;
+    const n = Math.max(6, Math.floor((2 * Math.PI * pitch) / (ball * 2.4)));
+    const sphere = new THREE.SphereGeometry(ball, 32, 16);
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2, m = new THREE.Mesh(sphere, darkSteel);
+      m.position.set(Math.cos(a) * pitch, L / 2, Math.sin(a) * pitch);
+      group.add(m);
+    }
+    if (q.get("seal")) {
+      for (const y of [0.4, L - 0.4]) {
+        const s = lathe(ringProfile(D - 2 * t + 0.2, d + 2 * t - 0.2, 0.3, 0), seal);
+        s.position.y = y - 0.15; group.add(s);
+      }
+    }
+    name ||= "Подшипник";
+    size = `⌀${f(d)} × ⌀${f(D)} × ${f(L)} мм`;
+  } else {
+    group.add(lathe(ringProfile(D, d, L, c), steel));
+    name ||= type === "washer" ? "Шайба" : "Втулка";
+    size = `⌀${f(D)} × ⌀${f(d)} × ${f(L)} мм`;
+    if (c) note = `фаски ${f(c)}×45°`;
+  }
+  return { group, name, size, note };
+}
+
+let part;
+try { part = build(); } catch (e) { fail("Открой модель из бота – в ссылке нет размеров детали."); throw e; }
+
+document.getElementById("name").textContent = part.name;
+document.getElementById("size").textContent = part.size;
+document.getElementById("note").textContent = demo
+  ? "Это пример. Пришли фото своей детали боту @slesarprod_bot – он сделает её модель."
+  : part.note;
+
+const box = new THREE.Box3().setFromObject(part.group);
+const center = box.getCenter(new THREE.Vector3());
+part.group.position.sub(center);
+const radius = box.getBoundingSphere(new THREE.Sphere()).radius;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.7;
+document.getElementById("scene").appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+const pivot = new THREE.Group();
+// Вал кладём на бок. Кольца стоят осью вверх, а камера смотрит сверху – торец всегда в кадре
+if (type === "shaft") { pivot.rotation.z = Math.PI / 2; pivot.rotation.x = 0.3; }
+pivot.add(part.group);
+scene.add(pivot);
+const light = new THREE.DirectionalLight(0xffffff, 0.6);
+light.position.set(1, 2, 1.5);
+scene.add(light);
+
+const camera = new THREE.PerspectiveCamera(35, innerWidth / innerHeight, radius / 100, radius * 100);
+// На вертикальном экране телефона узкий именно горизонтальный угол – вписываем по нему
+function fit() {
+  const v = THREE.MathUtils.degToRad(camera.fov);
+  const h = 2 * Math.atan(Math.tan(v / 2) * camera.aspect);
+  return radius / Math.sin(Math.min(v, h) / 2) * 1.08;
+}
+const elevation = THREE.MathUtils.degToRad({ shaft: 0, bearing: 55 }[type] ?? 40);
+camera.position.set(0, Math.sin(elevation), Math.cos(elevation)).setLength(fit());
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+// Кольца облетаем по кругу. Вал так уходит в торец и превращается в комок – его покачиваем
+const sway = type === "shaft";
+controls.autoRotate = !sway;
+controls.autoRotateSpeed = 2.2;
+controls.minDistance = radius * 1.2;
+controls.maxDistance = radius * 8;
+let touched = false;
+controls.addEventListener("start", () => { controls.autoRotate = false; touched = true; });
+
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  camera.position.setLength(fit());
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+renderer.setAnimationLoop(t => {
+  if (sway && !touched) pivot.rotation.y = 0.55 * Math.sin(t / 1400);
+  controls.update();
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
